@@ -5,7 +5,7 @@ use futures::executor::block_on;
 use commonware_consensus::Heightable as _;
 
 use super::{
-    ConsensusRequest, ExecutionTask, ExecutionTaskOutcome, ExecutionTaskType, VerifyBlockRequest,
+    ConsensusRequest, ExecutionTask, ExecutionTaskOutcome, ExecutionTaskType, PayloadRequest,
     queue_consensus_request,
 };
 use crate::consensus::Digest;
@@ -20,6 +20,7 @@ mod finalization;
 mod metrics;
 mod scheduling;
 mod verify;
+mod walk;
 
 use harness::{make_block, round};
 
@@ -48,11 +49,12 @@ fn consensus_requests_from_stale_rounds_are_dropped() {
     // stand in for both.
     fn validate_request(view: u64, height: u64) -> ConsensusRequest {
         let (response, _rx) = futures::channel::oneshot::channel();
-        ConsensusRequest::Verify(VerifyBlockRequest {
+        ConsensusRequest::Verify(PayloadRequest {
+            parent_round: round(view.saturating_sub(1)),
             cause: tracing::Span::none(),
             block: make_block(view, height, Digest(B256::ZERO)).into(),
             validator_set: None,
-            response,
+            response: Some(response),
         })
     }
 

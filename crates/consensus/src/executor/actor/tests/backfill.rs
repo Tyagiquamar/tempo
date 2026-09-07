@@ -81,7 +81,7 @@ fn backfill_then_converges_onto_a_notarized_extension() {
             .start(&context);
 
         // Startup first moves the local head and finality to the floor. The
-        // tree's pending head remains anchored at the network finalized tip,
+        // pending head remains anchored at the network finalized tip,
         // so normal notarized convergence can extend from that boundary.
         h.wait_until(|| h.execution.finalized() == Some((2, d2)))
             .await;
@@ -89,7 +89,7 @@ fn backfill_then_converges_onto_a_notarized_extension() {
 
         // Request a build two blocks above the backfilled boundary.
         // Supplying only that block first makes the actor discover and fetch
-        // the missing ancestor before forwarding both blocks bottom-up.
+        // the missing ancestor in response to SYNCING.
         let proposal = make_block(5, 5, d4);
         h.execution.script_built_payload(built_payload(&proposal));
         let build = h.build(round(5), d4);
@@ -107,7 +107,7 @@ fn backfill_then_converges_onto_a_notarized_extension() {
             h.marshal.subscribe_log(),
             vec![(d4, round(4)), (d3, round(3))],
         );
-        assert_eq!(h.execution.new_payloads(), vec![d1, d2, d3, d4]);
+        assert_eq!(h.execution.new_payloads(), vec![d1, d2, d4, d3, d4]);
         assert_eq!(
             h.execution.fcus(),
             vec![

@@ -827,11 +827,10 @@ struct VerifyResult {
 /// execution-layer work and records the block's body for the
 /// notarized-chain convergence.
 ///
-/// Returns the EL validation duration when validation reached the execution
-/// layer and succeeded, or `None` if the block is invalid. Returns an error
-/// if validation was not possible, for example if the execution layer does
-/// not know the block's parent or the request was superseded by a
-/// newer-round request.
+/// Returns the time spent in engine calls when validation succeeds, or `None`
+/// if the block is invalid. Missing parents keep verification pending while
+/// the executor delivers ancestors. Returns an error on execution-layer failure
+/// or if a newer-round request supersedes this request before it starts.
 async fn verify_block(
     context: Context<Digest, PublicKey>,
     epoch_strategy: &FixedEpocher,

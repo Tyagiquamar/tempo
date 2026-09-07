@@ -116,6 +116,7 @@ fn canceled_verification_keeps_its_parent_convergence_target() {
         let h = Harness::start_at_genesis(&context);
         let parent = make_block(1, 1, GENESIS);
         let parent_digest = parent.digest();
+        h.verify(round(1), parent).await.unwrap().unwrap();
         let candidate = make_block(2, 2, parent_digest);
         let candidate_digest = candidate.digest();
         let _release = h
@@ -130,16 +131,12 @@ fn canceled_verification_keeps_its_parent_convergence_target() {
         };
         drop(verify);
 
-        h.wait_until(|| {
-            h.marshal
-                .fulfill_subscription(parent_digest, parent.clone())
-        })
-        .await;
         h.wait_until(|| h.execution.head() == parent_digest).await;
         assert_eq!(
             h.execution.new_payloads(),
-            vec![candidate_digest, parent_digest]
+            vec![parent_digest, candidate_digest]
         );
+        assert!(h.marshal.subscribe_log().is_empty());
         assert!(
             h.execution
                 .fcus()
@@ -194,31 +191,31 @@ fn invalid_block_resolves_with_a_rejection() {
 }
 
 #[test_traced]
-fn unknown_parent_fails_fast_when_no_convergence_is_expected() {
+fn unknown_parent_keeps_verification_pending() {
     deterministic::Runner::default().start(|context| async move {
         let h = Harness::start_at_genesis(&context);
 
-        // b2's parent b1 was never seen. The request selects it as the pending
-        // head, but convergence needs a body fetch first. Verification still
-        // probes immediately, and SYNCING drops the response channel.
+        // b2's parent b1 was never seen. SYNCING keeps the candidate pending
+        // and requests its parent's body.
         let b1 = make_block(1, 1, GENESIS);
         let b2 = make_block(2, 2, b1.digest());
-        let _ = h
-            .verify(round(2), b2.clone())
-            .await
-            .expect_err("validation against an unknown parent must fail");
+        let mut verify = Box::pin(h.verify(round(2), b2.clone()));
+        assert!(futures::poll!(&mut verify).is_pending());
+        h.wait_until(|| h.marshal.open_subscriptions() == vec![(b1.digest(), round(1))])
+            .await;
+        assert!(futures::poll!(&mut verify).is_pending());
 
         assert_eq!(
             h.execution.new_payloads(),
             vec![b2.digest()],
-            "fail-fast still probes the execution layer",
+            "the candidate is probed before fetching its parent",
         );
         assert_eq!(h.execution.head(), GENESIS);
     });
 }
 
 #[test_traced]
-fn request_is_deferred_while_its_parent_converges_just_in_time() {
+fn syncing_at_the_finalized_tip_waits_for_finalization_delivery() {
     deterministic::Runner::default().start(|context| async move {
         let mut h = Harness::start_at_genesis(&context);
 
@@ -227,8 +224,7 @@ fn request_is_deferred_while_its_parent_converges_just_in_time() {
         let (d1, d2) = (b1.digest(), b2.digest());
 
         // The network tip names b1 and marshal will deliver it imminently;
-        // a validation on top of b1 must wait for that delivery instead of
-        // failing fast.
+        // SYNCING keeps verification pending until that delivery.
         h.deliver_tip(round(1), 1, d1);
 
         let verify = h.verify(round(2), b2.clone());
@@ -241,19 +237,19 @@ fn request_is_deferred_while_its_parent_converges_just_in_time() {
             }
             Either::Right(((), verify)) => verify,
         };
+        assert_eq!(h.execution.new_payloads(), vec![d2]);
         assert!(
-            h.execution.new_payloads().is_empty(),
-            "the deferred request must not probe the execution layer",
+            h.marshal.subscribe_log().is_empty(),
+            "finalization supplies the parent"
         );
 
-        // The finalized parent arrives; the executor forwards it and only
-        // then runs the deferred validation on top of it.
+        // The finalized parent arrives; its delivery wakes the candidate retry.
         h.deliver_finalized(b1)
             .await
             .expect("finalized block should be acknowledged");
         let verdict = verify.await.expect("verification should complete");
         assert!(verdict.is_some(), "the deferred block validates cleanly");
-        assert_eq!(h.execution.new_payloads(), vec![d1, d2]);
+        assert_eq!(h.execution.new_payloads(), vec![d2, d1, d2]);
     });
 }
 
@@ -317,9 +313,15 @@ fn newer_round_supersedes_a_queued_request() {
         let b2b = make_block(3, 2, b1.digest());
         let d1 = b1.digest();
 
-        // Both requests are held back by the just-in-time deferral on their
-        // parent b1, so they meet in the consensus-request slot.
+        // Keep the engine slot occupied so both requests arbitrate in the
+        // queued slot before either verification starts.
+        let release = h
+            .execution
+            .script_delayed_new_payload(d1, Ok(PayloadStatusEnum::Valid));
         h.deliver_tip(round(1), 1, d1);
+        let finalized = h.deliver_finalized(b1);
+        h.wait_until(|| h.execution.new_payloads() == vec![d1])
+            .await;
 
         let stale = h.verify(round(2), b2a);
         futures::pin_mut!(stale);
@@ -343,7 +345,8 @@ fn newer_round_supersedes_a_queued_request() {
         // response channel.
         let _ = stale.await.expect_err("the superseded request must fail");
 
-        h.deliver_finalized(b1)
+        release.send(()).unwrap();
+        finalized
             .await
             .expect("finalized block should be acknowledged");
         let verdict = newer.await.expect("verification should complete");
@@ -352,7 +355,7 @@ fn newer_round_supersedes_a_queued_request() {
 }
 
 #[test_traced]
-fn cancellation_before_verification_delivery_still_leaves_the_body_for_convergence() {
+fn a_later_build_fetches_the_parent_after_its_verification_was_canceled() {
     deterministic::Runner::default().start(|context| async move {
         let h = Harness::start_at_genesis(&context);
 
@@ -367,7 +370,7 @@ fn cancellation_before_verification_delivery_still_leaves_the_body_for_convergen
             .script_delayed_new_payload(d1, Ok(PayloadStatusEnum::Valid));
         h.execution
             .script_new_payload(d1, Ok(PayloadStatusEnum::Valid));
-        let verify = Box::pin(h.verify(round(1), b1));
+        let verify = Box::pin(h.verify(round(1), b1.clone()));
         let sleep = Box::pin(h.run_for(Duration::from_millis(1)));
         let verify = match futures::future::select(verify, sleep).await {
             Either::Left(_) => panic!("verification resolved before it could be abandoned"),
@@ -379,12 +382,15 @@ fn cancellation_before_verification_delivery_still_leaves_the_body_for_convergen
         drop(verify);
         h.run_for(Duration::from_millis(50)).await;
 
-        // The recorded body still serves convergence: no fetch is needed
-        // once a build names the block as its parent.
+        // The canceled walk released its body. A later build fetches its
+        // own parent and lets the execution layer decide what else is needed.
         let proposal = make_block(2, 2, d1);
         h.execution.script_built_payload(built_payload(&proposal));
-        h.build(round(2), d1).await.expect("build should complete");
+        let build = h.build(round(2), d1);
+        h.wait_until(|| h.marshal.fulfill_subscription(d1, b1.clone()))
+            .await;
+        build.await.expect("build should complete");
         h.wait_until(|| h.execution.head() == d1).await;
-        assert!(h.marshal.subscribe_log().is_empty());
+        assert_eq!(h.marshal.subscribe_log(), vec![(d1, round(1))]);
     });
 }

@@ -82,8 +82,8 @@ fn verification_supersedes_a_queued_build() {
     deterministic::Runner::default().start(|context| async move {
         let mut h = Harness::start_at_genesis(&context);
 
-        // Both requests defer on b1 while marshal is about to finalize it,
-        // forcing them to arbitrate in the shared pending slot.
+        // The build waits for b1 while marshal is about to finalize it.
+        // The newer verification replaces it, probes, and waits on SYNCING.
         let b1 = make_block(1, 1, GENESIS);
         let d1 = b1.digest();
         let candidate = make_block(3, 2, d1);
@@ -114,7 +114,10 @@ fn verification_supersedes_a_queued_build() {
                 .expect("the superseding verification should complete")
                 .is_some(),
         );
-        assert_eq!(h.execution.new_payloads(), vec![d1, candidate_digest]);
+        assert_eq!(
+            h.execution.new_payloads(),
+            vec![candidate_digest, d1, candidate_digest]
+        );
         assert!(
             !h.execution
                 .fcus()

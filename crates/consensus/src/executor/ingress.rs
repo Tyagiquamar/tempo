@@ -23,10 +23,13 @@ impl Mailbox {
     /// independently of whether the request completes or is canceled. Verifying
     /// the candidate does not make the candidate itself the pending head.
     ///
-    /// The block is validated via a single new-payload request, which requires
-    /// the execution layer to already know the block's parent. If it does not,
-    /// the request fails (the executor drops the response channel) and the
-    /// executor repairs the gap in the background instead.
+    /// On SYNCING, the executor retains the candidate and delivers ancestors
+    /// backward until the execution layer answers VALID or the finalized
+    /// boundary is reached. It then re-probes the candidate for its own verdict.
+    /// Finalized blocks are delivered by the finalization pipeline. A candidate
+    /// that remains SYNCING is retried with a delay; cancellation stops the walk.
+    /// The returned duration counts time spent in engine calls, excluding fetch
+    /// and retry waits.
     ///
     /// The round arbitrates the slot shared with build requests: only a
     /// request from a newer round replaces a queued one.

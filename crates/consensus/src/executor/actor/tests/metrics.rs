@@ -1,6 +1,4 @@
-//! Actor-level coverage for the executor's runtime metrics. The notarized
-//! tree unit tests cover the arithmetic; these tests prove that the actor
-//! publishes the measures after processing real messages and EL outcomes.
+//! Runtime metrics after processing consensus messages and EL outcomes.
 
 use commonware_macros::test_traced;
 use commonware_runtime::{Runner as _, deterministic};
@@ -19,35 +17,6 @@ fn gauge(h: &Harness, name: &str) -> i64 {
 }
 
 #[test_traced]
-fn notarized_tree_blocks_tracks_retained_and_pruned_bodies() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut h = Harness::start_at_genesis(&context);
-        assert_eq!(gauge(&h, "notarized_tree_blocks"), 0);
-
-        let b1 = make_block(1, 1, GENESIS);
-        let b2 = make_block(2, 2, b1.digest());
-        let d1 = b1.digest();
-        h.verify(round(1), b1)
-            .await
-            .expect("b1 verification should complete")
-            .expect("b1 should be valid");
-        h.verify(round(2), b2)
-            .await
-            .expect("b2 verification should complete")
-            .expect("b2 should be valid");
-
-        h.wait_until(|| gauge(&h, "notarized_tree_blocks") == 2)
-            .await;
-
-        // Advancing the network-finalized boundary prunes the covered body,
-        // while the body above it remains available for convergence.
-        h.deliver_tip(round(1), 1, d1);
-        h.wait_until(|| gauge(&h, "notarized_tree_blocks") == 1)
-            .await;
-    });
-}
-
-#[test_traced]
 fn finalization_lag_tracks_the_undelivered_finalized_backlog() {
     deterministic::Runner::default().start(|context| async move {
         let mut h = Harness::start_at_genesis(&context);
@@ -58,6 +27,7 @@ fn finalization_lag_tracks_the_undelivered_finalized_backlog() {
         let d2 = b2.digest();
         h.deliver_tip(round(2), 2, d2);
         h.wait_until(|| gauge(&h, "finalization_lag") == 2).await;
+        assert_eq!(gauge(&h, "convergence_depth"), 2);
 
         h.deliver_finalized(b1)
             .await
@@ -68,6 +38,7 @@ fn finalization_lag_tracks_the_undelivered_finalized_backlog() {
             .await
             .expect("b2 should be acknowledged");
         h.wait_until(|| gauge(&h, "finalization_lag") == 0).await;
+        assert_eq!(gauge(&h, "convergence_depth"), 0);
     });
 }
 
@@ -165,45 +136,5 @@ fn convergence_depth_is_negative_while_reanchoring_below_the_local_head() {
                 .expect("build must wait for the new branch's ancestry")
                 .is_none()
         );
-    });
-}
-
-#[test_traced]
-fn uncanonicalized_blocks_tracks_delivered_blocks_off_the_canonical_chain() {
-    deterministic::Runner::default().start(|context| async move {
-        let h = Harness::start_at_genesis(&context);
-        assert_eq!(gauge(&h, "uncanonicalized_blocks"), 0);
-
-        // A validated block is known to the execution layer but not its
-        // head yet.
-        let b1 = make_block(1, 1, GENESIS);
-        let d1 = b1.digest();
-        h.verify(round(1), b1)
-            .await
-            .expect("verification should complete")
-            .expect("block should be valid");
-        h.wait_until(|| gauge(&h, "uncanonicalized_blocks") == 1)
-            .await;
-
-        // Moving the head onto it canonicalizes it.
-        let proposal = make_block(2, 2, d1);
-        h.execution.script_built_payload(built_payload(&proposal));
-        h.build(round(2), d1)
-            .await
-            .expect("build should complete after canonicalizing its parent");
-        h.wait_until(|| h.execution.head() == d1).await;
-        h.wait_until(|| gauge(&h, "uncanonicalized_blocks") == 0)
-            .await;
-
-        // A newer verification of a sibling selects genesis as the parent.
-        // Converging back onto it leaves both validated blocks off-chain.
-        let a1 = make_block(3, 1, GENESIS);
-        h.verify(round(3), a1)
-            .await
-            .expect("verification should complete")
-            .expect("block should be valid");
-        h.wait_until(|| h.execution.head() == GENESIS).await;
-        h.wait_until(|| gauge(&h, "uncanonicalized_blocks") == 2)
-            .await;
     });
 }

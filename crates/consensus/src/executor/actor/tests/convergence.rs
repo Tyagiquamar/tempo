@@ -46,7 +46,7 @@ fn build_converges_onto_its_verified_parent() {
 }
 
 #[test_traced]
-fn missing_ancestor_bodies_are_fetched_and_forwarded_bottom_up() {
+fn build_parent_syncing_drives_ancestor_fetches_and_deliveries() {
     deterministic::Runner::default().start(|context| async move {
         let h = Harness::start_at_genesis(&context);
 
@@ -79,8 +79,8 @@ fn missing_ancestor_bodies_are_fetched_and_forwarded_bottom_up() {
         );
         assert_eq!(
             h.execution.new_payloads(),
-            vec![d1, d2, d3],
-            "blocks are delivered bottom-up",
+            vec![d3, d2, d1, d3],
+            "each SYNCING response requests a parent, then the target is re-probed",
         );
         assert_eq!(
             h.execution.fcus(),
@@ -91,7 +91,7 @@ fn missing_ancestor_bodies_are_fetched_and_forwarded_bottom_up() {
 }
 
 #[test_traced]
-fn long_delivery_runs_are_locked_in_every_few_blocks() {
+fn a_long_syncing_walk_waits_for_a_valid_target_before_forkchoice() {
     deterministic::Runner::default().start(|context| async move {
         let h = Harness::start_at_genesis(&context);
 
@@ -115,19 +115,19 @@ fn long_delivery_runs_are_locked_in_every_few_blocks() {
             .await;
         }
 
-        // The run is delivered bottom-up, with a forkchoice update forced
-        // after every eight deliveries so that the execution layer never
-        // holds more than that many uncanonicalized blocks.
+        // SYNCING does not prove that any head is ready. Even after eight
+        // deliveries the actor must wait for a VALID response before FCU.
         build
             .await
             .expect("build should complete after the long delivery run");
         assert_eq!(h.execution.head(), digests[9]);
-        assert_eq!(h.execution.new_payloads(), digests);
+        let mut deliveries = digests.iter().rev().copied().collect::<Vec<_>>();
+        deliveries.push(digests[9]);
+        assert_eq!(h.execution.new_payloads(), deliveries);
         assert_eq!(
             h.execution.fcus(),
             vec![
                 STARTUP_FCU,
-                (digests[7], GENESIS, false),
                 (digests[9], GENESIS, false),
                 (digests[9], GENESIS, true),
             ],
@@ -364,7 +364,7 @@ fn notarized_fcu_transport_error_is_fatal() {
 }
 
 #[test_traced]
-fn syncing_notarized_payload_is_rejected_without_updating_forkchoice() {
+fn syncing_at_the_finalized_boundary_waits_without_updating_forkchoice() {
     deterministic::Runner::default().start(|context| async move {
         let h = Harness::start_at_genesis(&context);
 

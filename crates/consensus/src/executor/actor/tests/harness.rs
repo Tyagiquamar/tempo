@@ -159,6 +159,9 @@ impl ForkchoiceStateExt for ForkchoiceState {
 struct ElState {
     /// Blocks known to the execution layer: hash -> (height, parent hash).
     blocks: HashMap<B256, (u64, B256)>,
+    /// Disconnected payloads. Accepting their missing ancestor connects them,
+    /// like Reth's engine tree, without another newPayload for each descendant.
+    buffered: HashMap<B256, (u64, B256)>,
     /// The canonical index: height -> hash, derived from accepted
     /// forkchoice updates (plus seeded history).
     canonical: BTreeMap<u64, B256>,
@@ -308,6 +311,7 @@ impl FakeExecution {
                 genesis,
                 state: Mutex::new(ElState {
                     blocks: HashMap::from([(genesis, (0, B256::ZERO))]),
+                    buffered: HashMap::new(),
                     canonical: BTreeMap::from([(0, genesis)]),
                     head: genesis,
                     finalized: None,
@@ -664,7 +668,20 @@ impl ExecutionLayer for FakeExecution {
                 )
             })?;
             if status == PayloadStatusEnum::Valid {
-                inner.state.lock().blocks.insert(digest, (height, parent));
+                let mut state = inner.state.lock();
+                state.buffered.remove(&digest);
+                state.blocks.insert(digest, (height, parent));
+                while let Some((hash, block)) = state
+                    .buffered
+                    .iter()
+                    .find(|(_, (_, parent))| state.blocks.contains_key(parent))
+                    .map(|(hash, block)| (*hash, *block))
+                {
+                    state.buffered.remove(&hash);
+                    state.blocks.insert(hash, block);
+                }
+            } else if status == PayloadStatusEnum::Syncing {
+                inner.state.lock().buffered.insert(digest, (height, parent));
             }
             Ok(PayloadStatus::from_status(status))
         }
