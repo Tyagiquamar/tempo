@@ -13,7 +13,10 @@ use alloy_evm::{
 use alloy_primitives::{Address, Bytes, TxKind};
 use reth_revm::{
     InspectSystemCallEvm, MainContext,
-    context::{CfgEnv, result::ExecutionResult},
+    context::{
+        CfgEnv,
+        result::{ExecutionResult, HaltReason},
+    },
 };
 use std::{
     cell::RefCell,
@@ -23,8 +26,8 @@ use std::{
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_precompiles::{storage::StorageAction, storage_credits::NonCreditableSlots};
 use tempo_revm::{
-    ProtocolFeeManager, TempoHaltReason, TempoInvalidTransaction, TempoTxEnv, ValidationContext,
-    evm::TempoContext, handler::TempoEvmHandler,
+    ProtocolFeeManager, TempoInvalidTransaction, TempoTxEnv, ValidationContext, evm::TempoContext,
+    handler::TempoEvmHandler,
 };
 
 use crate::{TempoBlockEnv, TempoPoolValidationEvm, TempoPoolValidationResult};
@@ -39,7 +42,7 @@ impl EvmFactory for TempoEvmFactory {
     type Context<DB: Database> = TempoContext<DB>;
     type Tx = TempoTxEnv;
     type Error<DBError: DBErrorMarker> = EVMError<DBError, TempoInvalidTransaction>;
-    type HaltReason = TempoHaltReason;
+    type HaltReason = HaltReason;
     type Spec = TempoHardfork;
     type BlockEnv = TempoBlockEnv;
     type Precompiles = PrecompilesMap;
@@ -203,6 +206,9 @@ where
         self.inner.skip_valid_after_check = true;
         self.inner.skip_liquidity_check = true;
         self.ctx_mut().cfg.disable_nonce_check = true;
+        // Pool admission enforces the T7 fee floor. The dynamic block base fee
+        // is checked during block selection/execution, once queued transactions can pay it.
+        self.ctx_mut().cfg.disable_base_fee = true;
     }
 
     fn validate_pool_transaction(
@@ -252,7 +258,7 @@ where
     type DB = DB;
     type Tx = TempoTxEnv;
     type Error = EVMError<DB::Error, TempoInvalidTransaction>;
-    type HaltReason = TempoHaltReason;
+    type HaltReason = HaltReason;
     type Spec = TempoHardfork;
     type BlockEnv = TempoBlockEnv;
     type Precompiles = PrecompilesMap;
@@ -1148,7 +1154,7 @@ mod tests {
         assert_matches!(
             result.result,
             ExecutionResult::Halt {
-                reason: TempoHaltReason::Ethereum(HaltReason::OutOfGas(_)),
+                reason: HaltReason::OutOfGas(_),
                 ..
             }
         );
