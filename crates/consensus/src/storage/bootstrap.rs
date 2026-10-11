@@ -1,5 +1,6 @@
 //! Establish a certified consensus anchor before starting a node after historical sync.
 
+use alloy_consensus::BlockHeader as _;
 use alloy_rpc_types_engine::ForkchoiceState;
 use commonware_consensus::types::{Epocher as _, FixedEpocher, Height};
 use commonware_runtime::{Clock as _, buffer::paged::CacheRef};
