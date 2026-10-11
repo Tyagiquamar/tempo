@@ -2,18 +2,24 @@
 
 mod utils;
 
-use super::{Config, init};
-use crate::consensus::Digest;
+use std::{num::NonZeroU64, time::Duration};
+
 use alloy_primitives::B256;
+use alloy_rpc_types_engine::{ForkchoiceUpdateError, PayloadStatusEnum};
 use commonware_consensus::{
     Reporter as _,
     marshal::Update,
     types::{Epoch, FixedEpocher, Height, Round, View},
 };
 use commonware_macros::test_traced;
-use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
-use commonware_utils::{Acknowledgement as _, acknowledgement::Exact};
-use std::{num::NonZeroU64, time::Duration};
+use commonware_runtime::{Handle, Runner as _, Supervisor as _, deterministic};
+use commonware_utils::{
+    Acknowledgement as _,
+    acknowledgement::{Exact, ExactWaiter},
+};
+
+use super::*;
+use crate::consensus::{Digest, block::Block};
 use utils::{StubExecutionProvider, StubMarshal, make_block, make_block_at_round};
 
 const EPOCH_LENGTH: NonZeroU64 = NonZeroU64::new(10).expect("epoch length is nonzero");
@@ -30,6 +36,50 @@ async fn wait_until<T: commonware_runtime::Clock>(context: &T, mut cond: impl Fn
     }
 
     assert!(cond(), "condition was not met before the test deadline");
+}
+
+fn start_snapshot_executor<T: Clock + Pacer + Spawner>(
+    context: T,
+) -> (StubExecutionProvider, Mailbox, Handle<()>) {
+    let provider = StubExecutionProvider::default();
+    provider.set_finalized(100, digest(100).0, round(10));
+    let (actor, mailbox) = init(
+        context,
+        Config {
+            execution_provider: provider.clone(),
+            execution_engine: provider.clone(),
+            marshal: StubMarshal::default(),
+            epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
+            floor: Height::zero(),
+            fcu_heartbeat_interval: HEARTBEAT_INTERVAL,
+        },
+    );
+    (provider, mailbox, actor.start())
+}
+
+fn report_block(mailbox: &mut Mailbox, block: Block) -> ExactWaiter {
+    let (ack, waiter) = Exact::handle();
+    assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
+    waiter
+}
+
+/// Make the stub apply finality before completing a successful block FCU.
+async fn canonicalize_block<T: commonware_runtime::Clock>(
+    context: &T,
+    mailbox: &mut Mailbox,
+    provider: &StubExecutionProvider,
+    block: Block,
+) {
+    let header = block.block().sealed_header().clone();
+    let tip = target::Target::from_header(&header);
+    let count = provider.forkchoices().len();
+    let release = provider.pause_next_forkchoice();
+    let acknowledged = report_block(mailbox, block);
+    wait_until(context, || provider.forkchoices().len() == count + 1).await;
+    assert_eq!(provider.forkchoices()[count].head_block_hash, tip.digest.0);
+    provider.set_finalized(header.inner.number, header.hash(), tip.round.unwrap());
+    release.send(()).expect("block FCU should still be waiting");
+    assert!(acknowledged.await.is_ok());
 }
 
 fn round(view: u64) -> Round {
@@ -80,9 +130,9 @@ fn block_is_executed_canonicalized_acknowledged_and_advances_floor_to_deep_candi
 
         let block = make_block_at_round(block_height, B256::with_last_byte(20), round(1));
         let block_hash = block.digest().0;
-        let (ack, waiter) = Exact::handle();
-        assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-        waiter.await.expect("valid payload should be acknowledged");
+        report_block(&mut mailbox, block)
+            .await
+            .expect("valid payload should be acknowledged");
 
         wait_until(&context, || marshal.floor() == Height::new(expected_floor)).await;
 
@@ -133,30 +183,22 @@ fn floor_candidate_uses_execution_depth_and_next_tip_starts_new_cycle() {
             );
         }
 
-        let (ack, waiter) = Exact::handle();
-        assert!(
-            mailbox
-                .report(Update::Block(
-                    make_block_at_round(19, B256::with_last_byte(18), round(1)).into(),
-                    ack,
-                ))
-                .accepted()
-        );
-        waiter.await.expect("valid payload should be acknowledged");
+        report_block(
+            &mut mailbox,
+            make_block_at_round(19, B256::with_last_byte(18), round(1)),
+        )
+        .await
+        .expect("valid payload should be acknowledged");
         context.sleep(Duration::from_millis(1)).await;
         assert_eq!(marshal.floor(), Height::zero());
 
         provider.set_finalized(19, B256::with_last_byte(19), Round::zero());
-        let (ack, waiter) = Exact::handle();
-        assert!(
-            mailbox
-                .report(Update::Block(
-                    make_block_at_round(20, B256::with_last_byte(19), round(2)).into(),
-                    ack,
-                ))
-                .accepted()
-        );
-        waiter.await.expect("valid payload should be acknowledged");
+        report_block(
+            &mut mailbox,
+            make_block_at_round(20, B256::with_last_byte(19), round(2)),
+        )
+        .await
+        .expect("valid payload should be acknowledged");
         wait_until(&context, || marshal.floor() == Height::new(9)).await;
 
         provider.set_finalized(39, B256::with_last_byte(39), Round::zero());
@@ -196,9 +238,9 @@ fn block_at_or_below_finalized_tip_does_not_regress_forkchoice() {
         actor.start();
 
         let block = make_block(finalized_height - 1, B256::with_last_byte(10));
-        let (ack, waiter) = Exact::handle();
-        assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-        waiter.await.expect("valid payload should be acknowledged");
+        report_block(&mut mailbox, block)
+            .await
+            .expect("valid payload should be acknowledged");
 
         assert_eq!(provider.payload_count(), 1);
         assert!(provider.forkchoices().is_empty());
@@ -249,9 +291,9 @@ fn floor_does_not_advance_until_its_execution_block_is_durable() {
         );
 
         let block = make_block(block_height, B256::with_last_byte(20));
-        let (ack, waiter) = Exact::handle();
-        assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-        waiter.await.expect("valid payload should be acknowledged");
+        report_block(&mut mailbox, block)
+            .await
+            .expect("valid payload should be acknowledged");
         context.sleep(Duration::from_millis(1)).await;
 
         assert_eq!(marshal.floor(), Height::zero());
@@ -279,9 +321,7 @@ fn invalid_payload_exits_without_acknowledging_or_canonicalizing() {
         let actor_handle = actor.start();
 
         let block = make_block(1, B256::with_last_byte(1));
-        let (ack, waiter) = Exact::handle();
-        assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-
+        let waiter = report_block(&mut mailbox, block);
         assert!(waiter.await.is_err(), "invalid payload must cancel its ack");
         actor_handle
             .await
@@ -296,7 +336,6 @@ fn invalid_payload_exits_without_acknowledging_or_canonicalizing() {
 fn forkchoice_failure_exits_without_acknowledging_block() {
     deterministic::Runner::default().start(|context| async move {
         let provider = StubExecutionProvider::default();
-        // TooDeepReorg without newer finality must remain fatal.
         provider.reject_forkchoices();
 
         let (actor, mut mailbox) = init(
@@ -313,9 +352,7 @@ fn forkchoice_failure_exits_without_acknowledging_block() {
         let actor_handle = actor.start();
 
         let block = make_block(1, B256::with_last_byte(1));
-        let (ack, waiter) = Exact::handle();
-        assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-
+        let waiter = report_block(&mut mailbox, block);
         assert!(waiter.await.is_err(), "rejected FCU must cancel the ack");
         actor_handle
             .await
@@ -426,28 +463,12 @@ fn tip_drives_forkchoice_by_round() {
 #[test_traced]
 fn delayed_tip_does_not_regress_newer_block_forkchoice() {
     deterministic::Runner::default().start(|context| async move {
-        let current = Digest(B256::with_last_byte(10));
-        let provider = StubExecutionProvider::default();
-        provider.set_finalized(100, current.0, round(10));
+        let (provider, mut mailbox, _) =
+            start_snapshot_executor(context.child("follower_executor"));
         let release_block_forkchoice = provider.pause_next_forkchoice();
-
-        let (actor, mut mailbox) = init(
-            context.child("follower_executor"),
-            Config {
-                execution_provider: provider.clone(),
-                execution_engine: provider.clone(),
-                marshal: StubMarshal::default(),
-                epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
-                floor: Height::zero(),
-                fcu_heartbeat_interval: HEARTBEAT_INTERVAL,
-            },
-        );
-        actor.start();
-
-        let block = make_block_at_round(101, current.0, round(13));
+        let block = make_block_at_round(101, digest(100).0, round(13));
         let newest = block.digest();
-        let (ack, waiter) = Exact::handle();
-        let _ = mailbox.report(Update::Block(block.into(), ack));
+        let waiter = report_block(&mut mailbox, block);
         wait_until(&context, || {
             provider.payload_count() == 1 && provider.forkchoices().len() == 1
         })
@@ -663,10 +684,7 @@ fn durable_block_read_failure_does_not_exit_actor() {
             (finalized_height + 2, round(2)),
         ] {
             let block = make_block_at_round(block_height, B256::with_last_byte(20), block_round);
-            let (ack, waiter) = Exact::handle();
-            assert!(mailbox.report(Update::Block(block.into(), ack)).accepted());
-
-            waiter
+            report_block(&mut mailbox, block)
                 .await
                 .expect("durability read errors must not stop block execution");
 
@@ -682,23 +700,8 @@ fn durable_block_read_failure_does_not_exit_actor() {
 #[test_traced]
 fn startup_uses_execution_finalized_tip_without_immediate_forkchoice() {
     deterministic::Runner::default().start(|context| async move {
-        let provider = StubExecutionProvider::default();
-        let finalized_hash = B256::with_last_byte(10);
-        provider.set_finalized(EPOCH_LENGTH.get(), finalized_hash, round(10));
-
-        let (actor, _mailbox) = init(
-            context.child("follower_executor"),
-            Config {
-                execution_provider: provider.clone(),
-                execution_engine: provider.clone(),
-                marshal: StubMarshal::default(),
-                epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
-                floor: Height::zero(),
-                fcu_heartbeat_interval: HEARTBEAT_INTERVAL,
-            },
-        );
-
-        actor.start();
+        let (provider, _mailbox, _) = start_snapshot_executor(context.child("follower_executor"));
+        let finalized_hash = digest(100).0;
 
         context.sleep(Duration::from_millis(1)).await;
         assert!(provider.forkchoices().is_empty());
@@ -712,166 +715,116 @@ fn startup_uses_execution_finalized_tip_without_immediate_forkchoice() {
 }
 
 #[test_traced]
-fn syncing_tip_allows_backfill_until_execution_finalizes_it() {
+fn snapshot_catch_up_canonicalizes_blocks_below_syncing_tip() {
     deterministic::Runner::default().start(|context| async move {
-        let provider = StubExecutionProvider::default();
-        let initial_hash = digest(100).0;
-        provider.set_finalized(100, initial_hash, round(10));
-        let future_hash = digest(200).0;
-        provider.set_forkchoice_syncing(future_hash, true);
-        let (actor, mut mailbox) = init(
-            context.child("follower_executor"),
-            Config {
-                execution_provider: provider.clone(),
-                execution_engine: provider.clone(),
-                marshal: StubMarshal::default(),
-                epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
-                floor: Height::zero(),
-                fcu_heartbeat_interval: Duration::from_millis(250),
-            },
-        );
-        actor.start();
-        let _ = mailbox.report(Update::Tip(
-            round(100),
-            Height::new(200),
-            Digest(future_hash),
-        ));
-        wait_until(&context, || provider.forkchoices().len() == 1).await;
+        let (provider, mut mailbox, _) =
+            start_snapshot_executor(context.child("follower_executor"));
+        provider.respond_next_forkchoice(Ok(PayloadStatusEnum::Syncing));
+        let first = make_block_at_round(101, digest(100).0, round(11));
+        let second = make_block_at_round(102, first.digest().0, round(12));
+        let third = make_block_at_round(103, second.digest().0, round(13));
+        let tip = third.digest();
 
-        let mut parent_hash = initial_hash;
-        let mut expected_heads = vec![future_hash];
-        for (height, view) in [(101, 11), (102, 12)] {
-            let block = make_block_at_round(height, parent_hash, round(view));
-            parent_hash = block.digest().0;
-            expected_heads.push(parent_hash);
-            let (ack, waiter) = Exact::handle();
-            let _ = mailbox.report(Update::Block(block.into(), ack));
-            waiter
-                .await
-                .expect("connected payload must be acknowledged");
+        let update = Update::Tip(round(13), Height::new(103), tip);
+        assert!(mailbox.report(update).accepted());
+        wait_until(&context, || provider.forkchoices().len() == 1).await;
+        context.sleep(Duration::from_millis(1)).await;
+        assert_eq!(provider.forkchoices().len(), 1, "SYNCING must not spin");
+        assert_eq!(provider.finalized_header().unwrap().hash(), digest(100).0);
+
+        for block in [first.clone(), second] {
+            canonicalize_block(&context, &mut mailbox, &provider, block).await;
         }
-        context.sleep(Duration::from_millis(1)).await;
-        assert_eq!(provider.payload_count(), 2);
-        assert_eq!(
-            provider
-                .forkchoices()
-                .iter()
-                .map(|fcu| fcu.head_block_hash)
-                .collect::<Vec<_>>(),
-            expected_heads,
-            "a syncing future target must not suppress connected-block FCUs or busy-loop",
-        );
+        assert_eq!(provider.forkchoices().len(), 3);
 
-        // Background sync can finalize the future tip without a VALID response.
-        provider.set_finalized(200, future_hash, round(100));
-        let block = make_block_at_round(103, parent_hash, round(13));
-        let (ack, waiter) = Exact::handle();
-        let _ = mailbox.report(Update::Block(block.into(), ack));
-        waiter.await.expect("backfill must still be acknowledged");
-        assert_eq!(provider.forkchoices().len(), expected_heads.len());
-
-        // Sync can also finish while a forkchoice request is in flight.
-        let release = provider.pause_next_forkchoice();
-        let block = make_block_at_round(201, future_hash, round(101));
-        let (ack, waiter) = Exact::handle();
-        let _ = mailbox.report(Update::Block(block.into(), ack));
+        // Catch-up must retain the newer tip for heartbeat retries.
+        provider.respond_next_forkchoice(Ok(PayloadStatusEnum::Syncing));
         wait_until(&context, || provider.forkchoices().len() == 4).await;
-        let synced_hash = digest(202).0;
-        provider.set_finalized(202, synced_hash, round(102));
-        release.send(()).unwrap();
-        waiter
-            .await
-            .expect("sync overtaking forkchoice must not stop the actor");
+        assert_eq!(provider.forkchoices()[3].head_block_hash, tip.0);
+        assert_eq!(provider.finalized_header().unwrap().inner.number, 102);
+        canonicalize_block(&context, &mut mailbox, &provider, third.clone()).await;
 
-        context.sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            provider.forkchoices().last().unwrap().head_block_hash,
-            synced_hash
-        );
-        let block = make_block_at_round(203, synced_hash, round(103));
-        let block_hash = block.digest().0;
-        let (ack, waiter) = Exact::handle();
-        let _ = mailbox.report(Update::Block(block.into(), ack));
-        waiter
-            .await
-            .expect("the follower must continue past the synced tip");
-        assert_eq!(
-            provider.forkchoices().last().unwrap().head_block_hash,
-            block_hash
-        );
+        let count = provider.forkchoices().len();
+        for block in [first, third] {
+            assert!(report_block(&mut mailbox, block).await.is_ok());
+            assert_eq!(provider.forkchoices().len(), count);
+        }
+        assert_eq!(provider.finalized_header().unwrap().hash(), tip.0);
+        wait_until(&context, || provider.forkchoices().len() == count + 1).await;
+        assert_eq!(provider.forkchoices()[count].head_block_hash, tip.0);
     });
 }
 
 #[test_traced]
-fn syncing_tip_retries_on_heartbeat_without_busy_loop() {
+fn syncing_block_forkchoice_does_not_skip_older_catch_up_block() {
     deterministic::Runner::default().start(|context| async move {
-        let provider = StubExecutionProvider::default();
-        let future_hash = digest(200).0;
-        provider.set_forkchoice_syncing(future_hash, true);
-        let (actor, mut mailbox) = init(
-            context.child("follower_executor"),
-            Config {
-                execution_provider: provider.clone(),
-                execution_engine: provider.clone(),
-                marshal: StubMarshal::default(),
-                epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
-                floor: Height::zero(),
-                fcu_heartbeat_interval: HEARTBEAT_INTERVAL,
-            },
-        );
-        actor.start();
-        let _ = mailbox.report(Update::Tip(
-            round(100),
-            Height::new(200),
-            Digest(future_hash),
-        ));
+        let (provider, mut mailbox, _) =
+            start_snapshot_executor(context.child("follower_executor"));
+        provider.respond_next_forkchoice(Ok(PayloadStatusEnum::Syncing));
+        let first = make_block_at_round(101, digest(100).0, round(11));
+        let second = make_block_at_round(102, first.digest().0, round(12));
+        let second_hash = second.digest().0;
+
+        assert!(report_block(&mut mailbox, second.clone()).await.is_ok());
+        assert_eq!(provider.finalized_header().unwrap().hash(), digest(100).0);
+        canonicalize_block(&context, &mut mailbox, &provider, first).await;
+        // A repeated request must still canonicalize the previously syncing block.
+        canonicalize_block(&context, &mut mailbox, &provider, second).await;
+        assert_eq!(provider.finalized_header().unwrap().hash(), second_hash);
+        assert_eq!(provider.forkchoices().len(), 3);
+    });
+}
+
+#[test_traced]
+fn pipeline_completion_does_not_regress_finalized_forkchoice() {
+    deterministic::Runner::default().start(|context| async move {
+        let (provider, mut mailbox, _) =
+            start_snapshot_executor(context.child("follower_executor"));
+        provider.respond_next_forkchoice(Ok(PayloadStatusEnum::Syncing));
+        let finalized = digest(103);
+        let update = Update::Tip(round(13), Height::new(103), finalized);
+        assert!(mailbox.report(update).accepted());
         wait_until(&context, || provider.forkchoices().len() == 1).await;
-        context.sleep(Duration::from_millis(1)).await;
+
+        // Pipeline finality advances without a VALID response to the actor.
+        provider.set_finalized(103, finalized.0, round(13));
+        let block = make_block_at_round(101, digest(100).0, round(11));
+        assert!(report_block(&mut mailbox, block).await.is_ok());
         assert_eq!(provider.forkchoices().len(), 1);
+        assert_eq!(provider.finalized_header().unwrap().hash(), finalized.0);
         wait_until(&context, || provider.forkchoices().len() == 2).await;
-        assert!(
-            provider
-                .forkchoices()
-                .iter()
-                .all(|fcu| fcu.head_block_hash == future_hash)
-        );
+        assert_eq!(provider.forkchoices()[1].head_block_hash, finalized.0);
     });
 }
 
 #[test_traced]
-fn syncing_block_forkchoice_is_retained_for_heartbeat_retry() {
-    deterministic::Runner::default().start(|context| async move {
-        let provider = StubExecutionProvider::default();
-        provider.set_finalized(100, digest(100).0, round(10));
-        let block = make_block_at_round(101, digest(100).0, round(11));
-        let block_hash = block.digest().0;
-        provider.set_forkchoice_syncing(block_hash, true);
-        let (actor, mut mailbox) = init(
-            context.child("follower_executor"),
-            Config {
-                execution_provider: provider.clone(),
-                execution_engine: provider.clone(),
-                marshal: StubMarshal::default(),
-                epoch_strategy: FixedEpocher::new(EPOCH_LENGTH),
-                floor: Height::zero(),
-                fcu_heartbeat_interval: HEARTBEAT_INTERVAL,
-            },
-        );
-        actor.start();
-        let (ack, waiter) = Exact::handle();
-        let _ = mailbox.report(Update::Block(block.into(), ack));
-        waiter
-            .await
-            .expect("syncing payload submission must be acknowledged");
-        context.sleep(Duration::from_millis(1)).await;
-        assert_eq!(provider.forkchoices().len(), 1);
-        provider.set_forkchoice_syncing(block_hash, false);
-        wait_until(&context, || provider.forkchoices().len() == 2).await;
-        assert!(
-            provider
-                .forkchoices()
-                .iter()
-                .all(|fcu| fcu.head_block_hash == block_hash)
-        );
-    });
+fn too_deep_reorg_is_tolerated_only_when_pipeline_advanced_finality() {
+    for advanced in [false, true] {
+        deterministic::Runner::default().start(|context| async move {
+            let (provider, mut mailbox, handle) =
+                start_snapshot_executor(context.child("follower_executor"));
+            provider.respond_next_forkchoice(Err(ForkchoiceUpdateError::TooDeepReorg.into()));
+            let release = provider.pause_next_forkchoice();
+            let block = make_block_at_round(101, digest(100).0, round(11));
+            let acknowledged = report_block(&mut mailbox, block);
+            wait_until(&context, || provider.forkchoices().len() == 1).await;
+
+            // Advance only after the actor's pre-FCU finalized-header read.
+            if advanced {
+                provider.set_finalized(103, digest(103).0, round(13));
+            }
+            release.send(()).unwrap();
+            assert_eq!(acknowledged.await.is_ok(), advanced);
+            let finalized = if advanced { digest(103) } else { digest(100) };
+            assert_eq!(provider.finalized_header().unwrap().hash(), finalized.0);
+
+            if advanced {
+                let block = make_block_at_round(102, digest(100).0, round(12));
+                assert!(report_block(&mut mailbox, block).await.is_ok());
+            } else {
+                handle.await.expect("unconfirmed reorg must stop the actor");
+            }
+            assert_eq!(provider.forkchoices().len(), 1);
+        });
+    }
 }

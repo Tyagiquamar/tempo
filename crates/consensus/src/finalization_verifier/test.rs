@@ -63,9 +63,9 @@ fn tracks_and_authenticates_boundary_identity() {
                 .is_err(),
             "accepted invalid floor signature"
         );
-        let mut wrong_epoch = next.outcome.clone();
+        let mut wrong_epoch = next.outcome;
         wrong_epoch.epoch = 2;
-        let mut wrong_sharing = current.outcome.clone();
+        let mut wrong_sharing = current.outcome;
         wrong_sharing.epoch = 1;
         for (name, boundary) in [
             ("DKG epoch", make_block(boundary_height, Some(&wrong_epoch))),
