@@ -1,9 +1,18 @@
 //! Test doubles and deterministic block construction for the follower executor.
 
-use alloy_consensus::{BlockHeader as _, Header};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+};
+
+use alloy_consensus::Header;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
-    ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
+    ForkchoiceState, ForkchoiceUpdated, PayloadStatus, PayloadStatusEnum,
 };
 use commonware_consensus::types::{Height, Round};
 use futures::channel::oneshot;
@@ -11,14 +20,6 @@ use parking_lot::Mutex;
 use reth_engine_primitives::BeaconForkChoiceUpdateError;
 use reth_ethereum::rpc::eth::primitives::BlockNumHash;
 use reth_node_core::primitives::{SealedBlock, SealedHeader};
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-};
 use tempo_node::TempoExecutionData;
 use tempo_payload_types::TempoPayloadAttributes;
 use tempo_primitives::{
@@ -67,12 +68,11 @@ struct StubExecutionProviderInner {
     durable: Mutex<HashMap<u64, B256>>,
     fail_durable_reads: AtomicBool,
     payloads: AtomicUsize,
-    payload_heights: Mutex<HashMap<B256, u64>>,
     forkchoices: Mutex<Vec<ForkchoiceState>>,
     reject_payloads: AtomicBool,
     reject_forkchoices: AtomicBool,
-    syncing_forkchoices: Mutex<HashSet<B256>>,
     forkchoice_gate: Mutex<Option<oneshot::Receiver<()>>>,
+    forkchoice_response: Mutex<Option<Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError>>>,
 }
 
 impl StubExecutionProvider {
@@ -104,15 +104,6 @@ impl StubExecutionProvider {
         self.inner.reject_forkchoices.store(true, Ordering::SeqCst);
     }
 
-    pub(super) fn set_forkchoice_syncing(&self, hash: B256, syncing: bool) {
-        let mut hashes = self.inner.syncing_forkchoices.lock();
-        if syncing {
-            hashes.insert(hash);
-        } else {
-            hashes.remove(&hash);
-        }
-    }
-
     pub(super) fn pause_next_forkchoice(&self) -> oneshot::Sender<()> {
         let (release, gate) = oneshot::channel();
         *self.inner.forkchoice_gate.lock() = Some(gate);
@@ -125,6 +116,13 @@ impl StubExecutionProvider {
 
     pub(super) fn forkchoices(&self) -> Vec<ForkchoiceState> {
         self.inner.forkchoices.lock().clone()
+    }
+
+    pub(super) fn respond_next_forkchoice(
+        &self,
+        response: Result<PayloadStatusEnum, BeaconForkChoiceUpdateError>,
+    ) {
+        *self.inner.forkchoice_response.lock() = Some(response.map(ForkchoiceUpdated::from_status));
     }
 }
 
@@ -165,13 +163,9 @@ impl FinalizedBlockProvider for StubExecutionProvider {
 impl ExecutionEngine for StubExecutionProvider {
     fn new_payload(
         &self,
-        payload: TempoExecutionData,
+        _payload: TempoExecutionData,
     ) -> impl Future<Output = eyre::Result<PayloadStatus>> + Send + 'static {
         self.inner.payloads.fetch_add(1, Ordering::SeqCst);
-        self.inner
-            .payload_heights
-            .lock()
-            .insert(payload.block.hash(), payload.block.number());
         let rejected = self.inner.reject_payloads.load(Ordering::SeqCst);
         async move {
             let status = if rejected {
@@ -189,38 +183,28 @@ impl ExecutionEngine for StubExecutionProvider {
         &self,
         state: ForkchoiceState,
         _attributes: Option<TempoPayloadAttributes>,
-    ) -> impl Future<Output = eyre::Result<ForkchoiceUpdated>> + Send + 'static {
+    ) -> impl Future<Output = Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError>> + Send + 'static
+    {
         self.inner.forkchoices.lock().push(state);
         let gate = self.inner.forkchoice_gate.lock().take();
-        let inner = self.inner.clone();
-        let rejected = self.inner.reject_forkchoices.load(Ordering::SeqCst);
-        let syncing = self
-            .inner
-            .syncing_forkchoices
-            .lock()
-            .contains(&state.head_block_hash);
+        let response = match self.inner.forkchoice_response.lock().take() {
+            Some(response) => response,
+            None => {
+                let status = if self.inner.reject_forkchoices.load(Ordering::SeqCst) {
+                    PayloadStatusEnum::Invalid {
+                        validation_error: "rejected by test engine".into(),
+                    }
+                } else {
+                    PayloadStatusEnum::Valid
+                };
+                Ok(ForkchoiceUpdated::from_status(status))
+            }
+        };
         async move {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
-            if rejected
-                || inner
-                    .payload_heights
-                    .lock()
-                    .get(&state.head_block_hash)
-                    .is_some_and(|height| *height < inner.finalized.lock().number)
-            {
-                return Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
-                    ForkchoiceUpdateError::TooDeepReorg,
-                )
-                .into());
-            }
-            let status = if syncing {
-                PayloadStatusEnum::Syncing
-            } else {
-                PayloadStatusEnum::Valid
-            };
-            Ok(ForkchoiceUpdated::from_status(status))
+            response
         }
     }
 }
