@@ -60,10 +60,9 @@ Shutdown reaps owned children. A failed or missing worker affects historical req
 live RPC stays available.
 
 Cancelled startup keeps its child so the next request can resume the handshake. Startup failures
-and detected child exits are retried on demand with exponential backoff from one second to five
-minutes. The delay resets after five minutes of worker uptime. Failed workers receive graceful
-shutdown before forced termination, and their RocksDB secondary directories are removed after
-reaping, including after crashes.
+and detected child exits are retried on demand after a 30-second cooldown. Failed workers receive
+graceful shutdown before forced termination, and their RocksDB secondary directories are removed
+after reaping, including after crashes.
 
 ## Canonical-file bootstrap
 
