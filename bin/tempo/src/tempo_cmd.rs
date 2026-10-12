@@ -1032,11 +1032,18 @@ impl GenerateSigningKey {
             warn_unencrypted_signing_key_deprecation();
         }
 
-        OpenOptions::new()
+        let mut open_options = OpenOptions::new();
+        open_options
             .write(true)
             .create_new(!force)
             .create(force)
-            .truncate(force)
+            .truncate(force);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options.mode(0o600);
+        }
+        open_options
             .open(&output)
             .map_err(Report::new)
             .and_then(|f| match passphrase {
@@ -1146,11 +1153,18 @@ impl EncryptSigningKey {
             )
         })?;
 
-        OpenOptions::new()
+        let mut open_options = OpenOptions::new();
+        open_options
             .write(true)
             .create_new(!force)
             .create(force)
-            .truncate(force)
+            .truncate(force);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options.mode(0o600);
+        }
+        open_options
             .open(&output)
             .map_err(Report::new)
             .and_then(|f| {
