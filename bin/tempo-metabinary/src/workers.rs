@@ -249,7 +249,6 @@ struct Process {
     ready: Option<Arc<HistoricalWorker>>,
     deadline: Instant,
     idle_since: Option<Instant>,
-    token: B256,
 }
 
 enum State {
@@ -262,8 +261,8 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
     let deadline = Instant::now()
         .checked_add(context.startup_timeout)
         .ok_or_eyre("historical worker startup timeout exceeds the clock range")?;
-    // Reserve a loopback port until immediately before spawn. A per-spawn secret in the
-    // child's environment authenticates its handshake if another process wins the bind race.
+    // Reserve a loopback port until immediately before spawn. The PID handshake detects
+    // accidental port collisions; local processes are trusted.
     let reservation = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let port = reservation.local_addr()?.port();
     let client = HttpClientBuilder::default()
@@ -277,9 +276,7 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         .as_ref()
         .expect("validated historical executable");
     let mut command = Command::new(binary);
-    let token = B256::from(rand::random::<[u8; 32]>());
     command
-        .env(crate::handshake::WORKER_TOKEN_ENV, token.to_string())
         .args(["rpc-only", "--chain", &context.chain, "--datadir"])
         .arg(&context.datadir)
         .args(["--port", &port.to_string()]);
@@ -301,7 +298,6 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         ready: None,
         deadline,
         idle_since: None,
-        token,
     })
 }
 
@@ -338,10 +334,6 @@ async fn ready(
         _ = workers.shutdown.cancelled() => { bail!("historical workers are shutting down"); },
         info = handshake => info?,
     };
-    ensure!(
-        info.worker_token == Some(process.token),
-        "worker token mismatch"
-    );
     info.methods.sort_unstable();
     tracing::debug!(era = %era.name, pid, "Historical RPC worker ready");
     Ok(Arc::new(HistoricalWorker {
@@ -385,11 +377,6 @@ mod tests {
             "chainId": if mode == "wrong-chain" { "0x2" } else { "0x1" },
             "genesisHash": format!("0x{}", if mode == "wrong-genesis" { "11" } else { "00" }.repeat(32)),
             "readOnly": mode != "writer",
-            "workerToken": match mode.as_str() {
-                "wrong-token" => Some(B256::ZERO.to_string()),
-                "missing-token" => None,
-                _ => std::env::var(crate::handshake::WORKER_TOKEN_ENV).ok(),
-            },
             "methods": match mode.as_str() {
                 "too-many-methods" => vec!["eth_call".to_owned(); MAX_RPC_METHODS + 1],
                 "long-method" => vec!["x".repeat(MAX_RPC_METHOD_NAME_LEN + 1)],
@@ -572,8 +559,6 @@ mod tests {
     async fn rejects_identity_mismatch_and_reaps_failed_startup() {
         for mode in [
             "wrong-pid",
-            "wrong-token",
-            "missing-token",
             "wrong-chain",
             "wrong-genesis",
             "writer",

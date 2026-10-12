@@ -52,10 +52,8 @@ Missing historical state fails through the worker's ordinary storage behavior.
   Bad-block tracing and `ots_getContractCreator` remain unsupported with era routing:
   bad-block cache resolution and whole-history deployment searches are not implemented.
 
-Workers are coalesced per era and verified by protocol, chain, genesis, read-only mode, PID,
-and a random per-spawn token passed through the child's environment and returned in discovery.
-The token is never sent in requests, so a process racing the loopback bind cannot learn it from
-the parent. This assumes other local users cannot read the child's environment.
+Workers are coalesced per era and verified by protocol, chain, genesis, read-only mode, and PID.
+The PID check detects accidental port collisions; local processes are trusted.
 Workers shut down after five idle minutes, checked every 30 seconds, and restart on demand.
 Active private RPC calls retain their worker; cancelling a caller drops its forwarding future.
 Shutdown reaps owned children. A failed or missing worker affects historical requests for its era;
@@ -107,8 +105,7 @@ canonical-file bootstrap remains available for offline imports. The active binar
 old forks; configuring and packaging a frozen replacement is a separate release change.
 Historical validator-config reads already use storage without constructing an EVM.
 
-Frozen artifacts need this `rpc-only` discovery protocol (including the `workerToken` echo from
-`TEMPO_HISTORICAL_WORKER_TOKEN`) and hidden `--rpc-config` interface,
+Frozen artifacts need this `rpc-only` discovery protocol and hidden `--rpc-config` interface,
 backported where necessary, plus a recorded revision and checksum. They must support their era and
 shared storage layout; identity discovery does not establish execution compatibility.
 
