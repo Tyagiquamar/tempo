@@ -31,6 +31,7 @@ pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Clones share one process per era. Startup is serialized independently for each era.
 ///
@@ -109,13 +110,25 @@ impl HistoricalWorkers {
             !self.shutdown.is_cancelled(),
             "historical workers are shutting down"
         );
-        if let State::Failed(error, retry_at) = &*state {
-            ensure!(Instant::now() >= *retry_at, "{error}");
+        let retry_delay = match &*state {
+            State::Failed(error, retry_at, delay, _) => {
+                ensure!(Instant::now() >= *retry_at, "{error}");
+                *delay
+            }
+            State::Running(process)
+                if process.ready.is_none() || process.started_at.elapsed() < IDLE_TIMEOUT =>
+            {
+                process.retry_delay
+            }
+            _ => RETRY_DELAY,
+        };
+        if matches!(*state, State::Failed(..)) {
+            state.cleanup_failed(&era.name).await?;
             *state = State::Dormant;
         }
         let result = async {
             if matches!(*state, State::Dormant) {
-                *state = State::Running(Box::new(spawn(&self.context, era)?));
+                *state = State::Running(Box::new(spawn(&self.context, era, retry_delay)?));
             }
             let State::Running(process) = &mut *state else {
                 unreachable!("spawned or failed")
@@ -137,13 +150,21 @@ impl HistoricalWorkers {
             Err(error) => {
                 let message = format!("historical era {} unavailable: {error:#}", era.name);
                 tracing::warn!(era = %era.name, %message, "Historical worker failed");
-                let previous = std::mem::replace(
-                    &mut *state,
-                    State::Failed(message.clone(), Instant::now() + RETRY_DELAY),
+                let process = match std::mem::replace(&mut *state, State::Dormant) {
+                    State::Running(process) => Some(process),
+                    _ => None,
+                };
+                *state = State::Failed(
+                    message.clone(),
+                    Instant::now() + retry_delay,
+                    (retry_delay * 2).min(MAX_RETRY_DELAY),
+                    process,
                 );
-                if let State::Running(mut process) = previous {
-                    // Keep this child owned while waiting. Cancellation falls back to kill_on_drop.
-                    let _ = process.child.kill().await;
+                if let Err(error) = state.cleanup_failed(&era.name).await {
+                    tracing::warn!(era = %era.name, %error, "Failed to clean up historical worker");
+                }
+                if let State::Failed(_, retry_at, _, _) = &mut *state {
+                    *retry_at = Instant::now() + retry_delay;
                 }
                 bail!("{message}");
             }
@@ -180,6 +201,10 @@ impl HistoricalWorkers {
             let Ok(mut state) = state.try_lock() else {
                 continue;
             };
+            if let Err(error) = state.cleanup_failed(&era.name).await {
+                tracing::warn!(era = %era.name, %error, "Failed to clean up historical worker");
+                continue;
+            }
             let State::Running(process) = &mut *state else {
                 continue;
             };
@@ -191,7 +216,7 @@ impl HistoricalWorkers {
             if now.duration_since(*process.idle_since.get_or_insert(now)) < IDLE_TIMEOUT {
                 continue;
             }
-            if let Err(error) = shutdown_children([(era.name.as_str(), &mut process.child)]).await {
+            if let Err(error) = process.stop(&era.name).await {
                 tracing::warn!(era = %era.name, %error, "Failed to reap idle historical worker");
                 continue;
             }
@@ -209,12 +234,17 @@ impl HistoricalWorkers {
                 .iter_mut()
                 .zip(&self.eras)
                 .filter_map(|(state, era)| match &mut **state {
-                    State::Running(process) => Some((era.name.as_str(), &mut process.child)),
+                    State::Running(process) | State::Failed(_, _, _, Some(process)) => {
+                        Some((era.name.as_str(), &mut process.child))
+                    }
                     _ => None,
                 }),
         )
         .await?;
         for state in &mut states {
+            if let State::Running(process) | State::Failed(_, _, _, Some(process)) = &**state {
+                process.cleanup()?;
+            }
             **state = State::Dormant;
         }
         Ok(())
@@ -249,15 +279,18 @@ struct Process {
     ready: Option<Arc<HistoricalWorker>>,
     deadline: Instant,
     idle_since: Option<Instant>,
+    started_at: Instant,
+    retry_delay: Duration,
+    secondary_path: PathBuf,
 }
 
 enum State {
     Dormant,
     Running(Box<Process>),
-    Failed(String, Instant),
+    Failed(String, Instant, Duration, Option<Box<Process>>),
 }
 
-fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
+fn spawn(context: &WorkerContext, era: &ReleaseEra, retry_delay: Duration) -> Result<Process> {
     let deadline = Instant::now()
         .checked_add(context.startup_timeout)
         .ok_or_eyre("historical worker startup timeout exceeds the clock range")?;
@@ -292,12 +325,24 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
     drop(reservation);
     let child =
         spawn_child(&mut command).wrap_err_with(|| format!("launching {}", binary.display()))?;
+    let rocksdb = context
+        .rocksdb_path
+        .clone()
+        .unwrap_or_else(|| context.datadir.join("rocksdb"));
+    // Match Reth's secondary naming and remove only this owned child's directory after reaping.
+    let secondary_path = rocksdb.parent().unwrap_or(&rocksdb).join(format!(
+        "rocksdb-secondary-tmp-{}",
+        child.id().ok_or_eyre("historical worker has no PID")?
+    ));
     Ok(Process {
         child,
         client,
         ready: None,
         deadline,
         idle_since: None,
+        started_at: Instant::now(),
+        retry_delay,
+        secondary_path,
     })
 }
 
@@ -342,6 +387,39 @@ async fn ready(
     }))
 }
 
+impl Process {
+    async fn stop(&mut self, name: &str) -> Result<()> {
+        shutdown_children([(name, &mut self.child)]).await?;
+        self.cleanup()
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        match std::fs::remove_dir_all(&self.secondary_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).wrap_err_with(|| {
+                format!(
+                    "removing historical secondary {}",
+                    self.secondary_path.display()
+                )
+            }),
+        }
+    }
+}
+
+impl State {
+    async fn cleanup_failed(&mut self, name: &str) -> Result<()> {
+        if let Self::Failed(_, _, _, Some(process)) = self {
+            // Retain ownership across awaits so cancellation cannot lose secondary cleanup.
+            process.stop(name).await?;
+        }
+        if let Self::Failed(_, _, _, process) = self {
+            *process = None;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -366,6 +444,16 @@ mod tests {
             .parse()
             .unwrap();
         let mode = std::env::var("TEMPO_WORKER_TEST_MODE").unwrap_or_default();
+        if mode == "wrong-chain-ignore-term" {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            tokio::spawn(async move {
+                while terminate.recv().await.is_some() {
+                    std::fs::write(std::env::var("TEMPO_WORKER_TEST_STOPPING").unwrap(), "")
+                        .unwrap();
+                }
+            });
+        }
         let delay = std::env::var("TEMPO_WORKER_TEST_DELAY_MS")
             .unwrap_or_default()
             .parse()
@@ -374,7 +462,7 @@ mod tests {
         let info = json!({
             "protocolVersion": EXECUTION_INFO_PROTOCOL_VERSION + u32::from(mode == "wrong-protocol"),
             "processId": std::process::id() + u32::from(mode == "wrong-pid"),
-            "chainId": if mode == "wrong-chain" { "0x2" } else { "0x1" },
+            "chainId": if mode.starts_with("wrong-chain") { "0x2" } else { "0x1" },
             "genesisHash": format!("0x{}", if mode == "wrong-genesis" { "11" } else { "00" }.repeat(32)),
             "readOnly": mode != "writer",
             "methods": match mode.as_str() {
@@ -421,11 +509,14 @@ mod tests {
             let binary = directory.path().join("tempo-frozen");
             let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
             let script = format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$0.starts\"\n\
+                "#!/bin/sh\nmkdir -p {secondary_root}/rocksdb-secondary-tmp-$$\n\
+                 printf '%s\\n' \"$$\" >> \"$0.starts\"\n\
                  while [ \"$1\" != --port ]; do shift; done\n\
                  export TEMPO_WORKER_TEST_PORT=\"$2\" TEMPO_WORKER_TEST_MODE={mode} TEMPO_WORKER_TEST_DELAY_MS={delay_ms}\n\
+                 export TEMPO_WORKER_TEST_STOPPING=\"$0.stopping\"\n\
                  exec {} --exact workers::tests::child_rpc_fixture --ignored --nocapture\n",
-                quote(std::env::current_exe().unwrap().to_str().unwrap())
+                quote(std::env::current_exe().unwrap().to_str().unwrap()),
+                secondary_root = quote(directory.path().to_str().unwrap()),
             );
             std::fs::write(&binary, script).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -579,6 +670,13 @@ mod tests {
             }
             let pid = fixture.spawned_pid().await;
             assert_reaped(pid);
+            assert!(
+                !fixture
+                    ._directory
+                    .path()
+                    .join(format!("rocksdb-secondary-tmp-{pid}"))
+                    .exists()
+            );
             assert!(fixture.workers.get(0).await.is_err());
             assert_eq!(fixture.pids(), [pid]);
             fixture.workers.shutdown().await.unwrap();
@@ -610,32 +708,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_startup_and_exited_workers_retry_after_backoff() {
+    async fn repeated_failures_back_off_and_clean_up_secondaries() {
         for mode in ["wrong-chain", ""] {
             let fixture = Fixture::new(mode, 0);
-            if mode.is_empty() {
-                fixture.workers.get(0).await.unwrap();
+            let unrelated = fixture
+                ._directory
+                .path()
+                .join("rocksdb-secondary-tmp-unrelated");
+            std::fs::create_dir(&unrelated).unwrap();
+            for seconds in [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
+                if mode.is_empty() {
+                    fixture.workers.get(0).await.unwrap();
+                    let mut state = fixture.workers.states[0].lock().await;
+                    let State::Running(process) = &mut *state else {
+                        unreachable!()
+                    };
+                    assert!(process.secondary_path.exists());
+                    process.child.kill().await.unwrap();
+                }
+                assert!(fixture.workers.get(0).await.is_err());
+                let pids = fixture.pids();
+                let pid = *pids.last().unwrap();
+                assert_reaped(pid);
+                assert!(
+                    !fixture
+                        ._directory
+                        .path()
+                        .join(format!("rocksdb-secondary-tmp-{pid}"))
+                        .exists()
+                );
+                assert!(unrelated.exists());
+                assert!(fixture.workers.get(0).await.is_err());
+                assert_eq!(fixture.pids(), pids);
+                let mut state = fixture.workers.states[0].lock().await;
+                let State::Failed(_, retry_at, next_delay, _) = &mut *state else {
+                    unreachable!()
+                };
+                let delay = Duration::from_secs(seconds);
+                assert!(*retry_at > Instant::now() + delay - Duration::from_secs(1));
+                assert!(*retry_at <= Instant::now() + delay);
+                assert_eq!(*next_delay, (delay * 2).min(MAX_RETRY_DELAY));
+                if seconds == 1 {
+                    drop(state);
+                    tokio::time::sleep(RETRY_DELAY).await;
+                } else {
+                    *retry_at = Instant::now();
+                }
+            }
+            let binary = fixture.workers.eras[0].binary.as_ref().unwrap();
+            let script = std::fs::read_to_string(binary).unwrap();
+            std::fs::write(binary, script.replace("MODE=wrong-chain", "MODE=")).unwrap();
+            fixture.workers.get(0).await.unwrap();
+            {
                 let mut state = fixture.workers.states[0].lock().await;
                 let State::Running(process) = &mut *state else {
                     unreachable!()
                 };
+                process.started_at = Instant::now() - IDLE_TIMEOUT;
                 process.child.kill().await.unwrap();
             }
             assert!(fixture.workers.get(0).await.is_err());
-            let pid = fixture.spawned_pid().await;
-            assert_reaped(pid);
-            assert!(fixture.workers.get(0).await.is_err());
-            assert_eq!(fixture.pids(), [pid]);
-
-            let binary = fixture.workers.eras[0].binary.as_ref().unwrap();
-            let script = std::fs::read_to_string(binary).unwrap();
-            std::fs::write(binary, script.replace("MODE=wrong-chain", "MODE=")).unwrap();
-            tokio::time::sleep(RETRY_DELAY).await;
-            let worker = fixture.workers.get(0).await.unwrap();
-            assert_ne!(worker.info.process_id, pid);
-            assert_eq!(fixture.pids(), [pid, worker.info.process_id]);
+            assert!(
+                matches!(*fixture.workers.states[0].lock().await, State::Failed(_, _, delay, _) if delay == RETRY_DELAY * 2)
+            );
             fixture.workers.shutdown().await.unwrap();
-            assert_reaped(worker.info.process_id);
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_failure_cleanup_retains_the_child_and_secondary() {
+        let fixture = Fixture::new("wrong-chain-ignore-term", 0);
+        let workers = fixture.workers.clone();
+        let request = tokio::spawn(async move { workers.get(0).await });
+        let binary = fixture.workers.eras[0].binary.as_ref().unwrap();
+        let stopping = PathBuf::from(format!("{}.stopping", binary.display()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stopping.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let secondary = {
+            let mut state = fixture.workers.states[0].lock().await;
+            let State::Failed(_, _, _, Some(process)) = &mut *state else {
+                unreachable!()
+            };
+            assert!(process.secondary_path.exists());
+            process.child.kill().await.unwrap();
+            process.secondary_path.clone()
+        };
+        fixture.workers.reap_idle().await;
+        assert!(!secondary.exists());
+        assert!(matches!(
+            *fixture.workers.states[0].lock().await,
+            State::Failed(_, _, _, None)
+        ));
+        assert_eq!(fixture.pids().len(), 1);
+        assert_reaped(fixture.pids()[0]);
+        fixture.workers.shutdown().await.unwrap();
     }
 }
