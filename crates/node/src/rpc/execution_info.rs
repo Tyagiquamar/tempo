@@ -7,6 +7,8 @@ use jsonrpsee::{
     types::ErrorObjectOwned,
 };
 use reth_rpc_builder::TransportRpcModules;
+use tempo_metabinary::handshake::WORKER_TOKEN_ENV;
+
 pub use tempo_metabinary::handshake::{
     EXECUTION_INFO_METHOD, EXECUTION_INFO_PROTOCOL_VERSION, ExecutionInfo,
 };
@@ -38,6 +40,9 @@ fn info_module(
         genesis_hash,
         read_only,
         methods: names,
+        worker_token: read_only
+            .then(|| std::env::var(WORKER_TOKEN_ENV).ok()?.parse().ok())
+            .flatten(),
     });
     module.register_method(EXECUTION_INFO_METHOD, |_, info, _| {
         Ok::<_, ErrorObjectOwned>(info.clone())

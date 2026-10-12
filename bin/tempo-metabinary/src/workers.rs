@@ -30,6 +30,7 @@ pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Clones share one process per era. Startup is serialized independently for each era.
 ///
@@ -108,8 +109,9 @@ impl HistoricalWorkers {
             !self.shutdown.is_cancelled(),
             "historical workers are shutting down"
         );
-        if let State::Failed(error) = &*state {
-            bail!("{error}");
+        if let State::Failed(error, retry_at) = &*state {
+            ensure!(Instant::now() >= *retry_at, "{error}");
+            *state = State::Dormant;
         }
         let result = async {
             if matches!(*state, State::Dormant) {
@@ -135,7 +137,10 @@ impl HistoricalWorkers {
             Err(error) => {
                 let message = format!("historical era {} unavailable: {error:#}", era.name);
                 tracing::warn!(era = %era.name, %message, "Historical worker failed");
-                let previous = std::mem::replace(&mut *state, State::Failed(message.clone()));
+                let previous = std::mem::replace(
+                    &mut *state,
+                    State::Failed(message.clone(), Instant::now() + RETRY_DELAY),
+                );
                 if let State::Running(mut process) = previous {
                     // Keep this child owned while waiting. Cancellation falls back to kill_on_drop.
                     let _ = process.child.kill().await;
@@ -163,12 +168,10 @@ impl HistoricalWorkers {
                 self.eras[index].name
             )));
         }
-        let method = method.to_owned();
-        // A cancelled caller may leave execution running in the child. Keep the lease until its
-        // private response completes, so cancelled requests cannot make a busy worker look idle.
-        tokio::spawn(async move { worker.client.request(&method, params).await })
+        worker
+            .client
+            .request(method, params)
             .await
-            .map_err(execution_error)?
             .map_err(upstream_error)
     }
 
@@ -186,10 +189,6 @@ impl HistoricalWorkers {
             }
             let now = Instant::now();
             if now.duration_since(*process.idle_since.get_or_insert(now)) < IDLE_TIMEOUT {
-                continue;
-            }
-            // Preserve sticky failure diagnostics for workers that exited unexpectedly.
-            if !matches!(process.child.try_wait(), Ok(None)) {
                 continue;
             }
             if let Err(error) = shutdown_children([(era.name.as_str(), &mut process.child)]).await {
@@ -250,20 +249,21 @@ struct Process {
     ready: Option<Arc<HistoricalWorker>>,
     deadline: Instant,
     idle_since: Option<Instant>,
+    token: B256,
 }
 
 enum State {
     Dormant,
     Running(Box<Process>),
-    Failed(String),
+    Failed(String, Instant),
 }
 
 fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
     let deadline = Instant::now()
         .checked_add(context.startup_timeout)
         .ok_or_eyre("historical worker startup timeout exceeds the clock range")?;
-    // Reserve a loopback port until immediately before spawn. The worker binds independently;
-    // its PID handshake detects the small remaining bind race and prevents misrouting.
+    // Reserve a loopback port until immediately before spawn. A per-spawn secret in the
+    // child's environment authenticates its handshake if another process wins the bind race.
     let reservation = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let port = reservation.local_addr()?.port();
     let client = HttpClientBuilder::default()
@@ -277,7 +277,9 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         .as_ref()
         .expect("validated historical executable");
     let mut command = Command::new(binary);
+    let token = B256::from(rand::random::<[u8; 32]>());
     command
+        .env(crate::handshake::WORKER_TOKEN_ENV, token.to_string())
         .args(["rpc-only", "--chain", &context.chain, "--datadir"])
         .arg(&context.datadir)
         .args(["--port", &port.to_string()]);
@@ -299,6 +301,7 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         ready: None,
         deadline,
         idle_since: None,
+        token,
     })
 }
 
@@ -335,6 +338,10 @@ async fn ready(
         _ = workers.shutdown.cancelled() => { bail!("historical workers are shutting down"); },
         info = handshake => info?,
     };
+    ensure!(
+        info.worker_token == Some(process.token),
+        "worker token mismatch"
+    );
     info.methods.sort_unstable();
     tracing::debug!(era = %era.name, pid, "Historical RPC worker ready");
     Ok(Arc::new(HistoricalWorker {
@@ -378,17 +385,22 @@ mod tests {
             "chainId": if mode == "wrong-chain" { "0x2" } else { "0x1" },
             "genesisHash": format!("0x{}", if mode == "wrong-genesis" { "11" } else { "00" }.repeat(32)),
             "readOnly": mode != "writer",
+            "workerToken": match mode.as_str() {
+                "wrong-token" => Some(B256::ZERO.to_string()),
+                "missing-token" => None,
+                _ => std::env::var(crate::handshake::WORKER_TOKEN_ENV).ok(),
+            },
             "methods": match mode.as_str() {
                 "too-many-methods" => vec!["eth_call".to_owned(); MAX_RPC_METHODS + 1],
                 "long-method" => vec!["x".repeat(MAX_RPC_METHOD_NAME_LEN + 1)],
                 _ => vec![EXECUTION_INFO_METHOD.into(), "eth_call".into()],
             }
         });
-        let mut methods = RpcModule::new((info, mode == "stalled"));
+        let mut methods = RpcModule::new((info, mode.clone()));
         if mode != "missing-protocol" {
             methods
                 .register_async_method(EXECUTION_INFO_METHOD, |_, info, _| async move {
-                    if info.1 {
+                    if info.1 == "stalled" {
                         std::future::pending::<()>().await;
                     }
                     info.0.clone()
@@ -396,7 +408,12 @@ mod tests {
                 .unwrap();
         }
         methods
-            .register_method("eth_call", |params, _, _| params.parse::<Value>())
+            .register_async_method("eth_call", |params, info, _| async move {
+                if info.1 == "stalled-call" {
+                    std::future::pending::<()>().await;
+                }
+                params.parse::<Value>()
+            })
             .unwrap();
         let server = ServerBuilder::default()
             .build((std::net::Ipv4Addr::LOCALHOST, port))
@@ -523,21 +540,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_calls_do_not_trigger_idle_shutdown() {
-        let fixture = Fixture::new("", 0);
+    async fn cancelled_calls_release_the_worker() {
+        let fixture = Fixture::new("stalled-call", 0);
         let workers = &fixture.workers;
         let pid = workers.get(0).await.unwrap().info.process_id;
-        let call = workers.request(0, "eth_call", RpcParams(json!([])));
-        assert!(call.now_or_never().is_none());
+        {
+            let call = workers.request(0, "eth_call", RpcParams(json!([])));
+            tokio::pin!(call);
+            assert!(call.as_mut().now_or_never().is_none());
+            let state = workers.states[0].lock().await;
+            let State::Running(process) = &*state else {
+                unreachable!()
+            };
+            assert_eq!(Arc::strong_count(process.ready.as_ref().unwrap()), 2);
+        }
         {
             let mut state = workers.states[0].lock().await;
             let State::Running(process) = &mut *state else {
                 unreachable!()
             };
+            assert_eq!(Arc::strong_count(process.ready.as_ref().unwrap()), 1);
             process.idle_since = Some(Instant::now() - IDLE_TIMEOUT);
         }
         workers.reap_idle().await;
-        assert_eq!(workers.get(0).await.unwrap().info.process_id, pid);
+        assert!(matches!(*workers.states[0].lock().await, State::Dormant));
+        assert_reaped(pid);
         workers.shutdown().await.unwrap();
     }
 
@@ -545,6 +572,8 @@ mod tests {
     async fn rejects_identity_mismatch_and_reaps_failed_startup() {
         for mode in [
             "wrong-pid",
+            "wrong-token",
+            "missing-token",
             "wrong-chain",
             "wrong-genesis",
             "writer",
@@ -592,6 +621,36 @@ mod tests {
                 fixture.workers.shutdown().await.unwrap();
             }
             assert_reaped(pid);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_startup_and_exited_workers_retry_after_backoff() {
+        for mode in ["wrong-chain", ""] {
+            let fixture = Fixture::new(mode, 0);
+            if mode.is_empty() {
+                fixture.workers.get(0).await.unwrap();
+                let mut state = fixture.workers.states[0].lock().await;
+                let State::Running(process) = &mut *state else {
+                    unreachable!()
+                };
+                process.child.kill().await.unwrap();
+            }
+            assert!(fixture.workers.get(0).await.is_err());
+            let pid = fixture.spawned_pid().await;
+            assert_reaped(pid);
+            assert!(fixture.workers.get(0).await.is_err());
+            assert_eq!(fixture.pids(), [pid]);
+
+            let binary = fixture.workers.eras[0].binary.as_ref().unwrap();
+            let script = std::fs::read_to_string(binary).unwrap();
+            std::fs::write(binary, script.replace("MODE=wrong-chain", "MODE=")).unwrap();
+            tokio::time::sleep(RETRY_DELAY).await;
+            let worker = fixture.workers.get(0).await.unwrap();
+            assert_ne!(worker.info.process_id, pid);
+            assert_eq!(fixture.pids(), [pid, worker.info.process_id]);
+            fixture.workers.shutdown().await.unwrap();
+            assert_reaped(worker.info.process_id);
         }
     }
 }

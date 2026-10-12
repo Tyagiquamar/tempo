@@ -16,6 +16,7 @@ pub const EXECUTION_INFO_METHOD: &str = "tempo_executionInfo";
 pub const EXECUTION_INFO_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const MAX_RPC_METHODS: usize = 1024;
 pub(crate) const MAX_RPC_METHOD_NAME_LEN: usize = 256;
+pub const WORKER_TOKEN_ENV: &str = "TEMPO_HISTORICAL_WORKER_TOKEN";
 
 /// The actual private transport's registered methods, not a global RPC catalogue.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -27,6 +28,9 @@ pub struct ExecutionInfo {
     pub read_only: bool,
     pub process_id: u32,
     pub methods: Vec<String>,
+    /// Per-spawn secret returned only by private read-only workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_token: Option<B256>,
 }
 
 impl ExecutionInfo {
