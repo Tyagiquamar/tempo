@@ -53,9 +53,9 @@ Missing historical state fails through the worker's ordinary storage behavior.
   bad-block cache resolution and whole-history deployment searches are not implemented.
 
 Workers are coalesced per era and verified by protocol, chain, genesis, read-only mode, and PID.
-The PID check detects accidental port collisions; local processes are trusted.
+The PID check detects accidental port collisions. Local processes are trusted.
 Workers shut down after five idle minutes, checked every 30 seconds, and restart on demand.
-Active private RPC calls retain their worker; cancelling a caller drops its forwarding future.
+Active private RPC calls retain their worker. Cancelling a caller drops its forwarding future.
 Shutdown reaps owned children. A failed or missing worker affects historical requests for its era;
 live RPC stays available.
 

@@ -262,7 +262,7 @@ fn spawn(context: &WorkerContext, era: &ReleaseEra) -> Result<Process> {
         .checked_add(context.startup_timeout)
         .ok_or_eyre("historical worker startup timeout exceeds the clock range")?;
     // Reserve a loopback port until immediately before spawn. The PID handshake detects
-    // accidental port collisions; local processes are trusted.
+    // accidental port collisions. Local processes are trusted.
     let reservation = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let port = reservation.local_addr()?.port();
     let client = HttpClientBuilder::default()
